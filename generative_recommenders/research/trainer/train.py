@@ -22,6 +22,8 @@ from datetime import date
 from typing import Dict, Optional
 
 import gin
+import math
+import pandas as pd
 import torch
 import torch.distributed as dist
 from generative_recommenders.research.data.eval import (
@@ -89,6 +91,108 @@ def get_weighted_loss(
         weighted_loss = weighted_loss + cur_weighted_loss
     return weighted_loss
 
+def make_log_q_table_from_genrec_dataset(
+    dataset,
+    dataset_name: str,
+    power: float = 0.75,
+    eps: float = 1e-8,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    适配genrec仓库的Log-Q表构建：
+    - 从预处理后的ratings.csv读取物品频次
+    - 兼容ml-1m/ml-20m/amzn-books数据集
+    """
+    prefix = dataset_name  
+    ratings_path = f"tmp/processed/{prefix}/ratings.csv"
+    if prefix in ["ml-1m", "ml-20m", "ml-20mx16x32"]:
+        item_col = "movie_id"
+    else:  # amzn-books
+        item_col = "item_id"
+    ratings_df = pd.read_csv(ratings_path)
+    item_counts = ratings_df[item_col].value_counts().to_dict()
+    vocab_size = dataset.max_item_id + 1
+    logq_table = torch.full((vocab_size,), float("-inf"), dtype=dtype, device=device)
+    total_count = sum(item_counts.values()) + eps
+    for item_id, count in item_counts.items():
+        if item_id >= vocab_size:
+            continue
+        freq = (count ** power) / total_count
+        logq_table[int(item_id)] = math.log(freq + eps)
+    miss_mask = (logq_table == float("-inf"))
+    if miss_mask.any():
+        tiny_freq = 1.0 / (vocab_size * 1e3)
+        logq_table[miss_mask] = math.log(tiny_freq + eps)
+    return logq_table
+
+# 混合负采样器（50%in-batch+50%global）+ Log-Q适配版
+@gin.configurable
+class HybridNegativesSampler:
+    def __init__(
+        self,
+        num_items: int,
+        item_emb: torch.nn.Embedding,
+        all_item_ids: torch.Tensor,
+        log_q_table: torch.Tensor,  # ===== 新增：接收Log-Q表 =====
+        l2_norm: bool = False,
+        l2_norm_eps: float = 1e-6,
+        dedup_embeddings: bool = True,
+    ):
+        # 初始化两个子采样器，并传递Log-Q表 ===== 核心适配：1行代码 =====
+        self.inbatch_sampler = InBatchNegativesSampler(l2_norm=l2_norm, l2_norm_eps=l2_norm_eps, dedup_embeddings=dedup_embeddings)
+        self.global_sampler = LocalNegativesSampler(num_items=num_items, item_emb=item_emb, all_item_ids=all_item_ids, l2_norm=l2_norm, l2_norm_eps=l2_norm_eps)
+        
+        # ===== 新增：将Log-Q表赋值给子采样器，保证采样分布与纠偏对齐 =====
+        self.inbatch_sampler.log_q_table = self.global_sampler.log_q_table = log_q_table
+        
+        self.l2_norm = l2_norm
+        self.l2_norm_eps = l2_norm_eps
+        self.dedup_embeddings = dedup_embeddings
+        self._device = None
+
+    # 以下所有方法（to/process_batch/sample_negatives/debug_str）完全不变！！！
+    def to(self, device: torch.device):
+        self.inbatch_sampler = self.inbatch_sampler.to(device)
+        self.global_sampler = self.global_sampler.to(device)
+        self._device = device
+        return self
+
+    def process_batch(self, ids: torch.Tensor, presences: torch.Tensor, embeddings: torch.Tensor):
+        self.inbatch_sampler.process_batch(ids=ids, presences=presences, embeddings=embeddings)
+        self.global_sampler._item_emb = self.inbatch_sampler._item_emb if hasattr(self.inbatch_sampler, '_item_emb') else self.global_sampler._item_emb
+        return self
+
+    def sample_negatives(self, *args, **kwargs):
+        num_negatives = kwargs.get('num_negatives', 1)
+        num_inbatch = (num_negatives + 1) // 2
+        num_global = num_negatives // 2
+
+        # 分别采样
+        inbatch_neg_emb, inbatch_neg_ids = self.inbatch_sampler.sample_negatives(*args, num_negatives=num_inbatch, **kwargs)
+        global_neg_emb, global_neg_ids = self.global_sampler.sample_negatives(*args, num_negatives=num_global, **kwargs)
+
+        # 拼接负样本
+        hybrid_neg_emb = torch.cat([inbatch_neg_emb, global_neg_emb], dim=1)
+        hybrid_neg_ids = torch.cat([inbatch_neg_ids, global_neg_ids], dim=1) if inbatch_neg_ids is not None else None
+
+        # 去重+补采
+        if self.dedup_embeddings and hybrid_neg_ids is not None:
+            hybrid_neg_ids, unique_idx = torch.unique(hybrid_neg_ids, dim=1, return_index=True)
+            hybrid_neg_emb = hybrid_neg_emb[:, unique_idx, :]
+            if hybrid_neg_emb.shape[1] < num_negatives:
+                num_pad = num_negatives - hybrid_neg_emb.shape[1]
+                pad_neg_emb, pad_neg_ids = self.global_sampler.sample_negatives(*args, num_negatives=num_pad, **kwargs)
+                hybrid_neg_emb = torch.cat([hybrid_neg_emb, pad_neg_emb], dim=1)
+                hybrid_neg_ids = torch.cat([hybrid_neg_ids, pad_neg_ids], dim=1)
+        
+        print(f"混合采样：in-batch{num_inbatch}个 + global{num_global}个 → 总{hybrid_neg_emb.shape[1]}个")
+        return hybrid_neg_emb, hybrid_neg_ids
+
+    def debug_str(self):
+        inbatch_str = self.inbatch_sampler.debug_str()
+        global_str = self.global_sampler.debug_str()
+        return f"hybrid-50inbatch-50global_{inbatch_str}_{global_str}"
 
 @gin.configurable
 def train_fn(
@@ -210,6 +314,31 @@ def train_fn(
     )
     model_debug_str = model.debug_str()
 
+    logq_table = None
+    dtype = torch.bfloat16 if main_module_bf16 else torch.float32
+    if rank == 0:
+        logq_table = make_log_q_table_from_genrec_dataset(
+            dataset=dataset,
+            dataset_name=dataset_name,
+            power=0.75,
+            eps=1e-8,
+            device=torch.device("cpu"),
+            dtype=dtype,
+        )
+    if world_size > 1:
+        if rank == 0:
+            logq_table = logq_table.to(rank)
+        else:
+            logq_table = torch.full(
+                (dataset.max_item_id + 1,),
+                float("-inf"),
+                dtype=dtype,
+                device=rank
+            )
+        dist.broadcast(logq_table, src=0)
+    else:
+        logq_table = logq_table.to(rank)
+
     # loss
     loss_debug_str = loss_module
     if loss_module == "BCELoss":
@@ -226,12 +355,14 @@ def train_fn(
             model=model,
             activation_checkpoint=loss_activation_checkpoint,
         )
+        print(f"损失层Log-Q表形状：{ar_loss.log_q_table.shape}")
+        print(f"混合采样器Log-Q表形状：{negatives_sampler.inbatch_sampler.log_q_table.shape}")
         loss_debug_str += (
             f"-n{num_negatives}{'-ac' if loss_activation_checkpoint else ''}"
         )
     else:
         raise ValueError(f"Unrecognized loss module {loss_module}.")
-
+    
     # sampling
     if sampling_strategy == "in-batch":
         negatives_sampler = InBatchNegativesSampler(
@@ -250,6 +381,17 @@ def train_fn(
             l2_norm=item_l2_norm,
             l2_norm_eps=l2_norm_eps,
         )
+    elif sampling_strategy == "hybrid":
+        negatives_sampler = HybridNegativesSampler(
+            num_items=dataset.max_item_id,
+            item_emb=model._embedding_module._item_emb,
+            all_item_ids=dataset.all_item_ids,
+            log_q_table=logq_table,
+            l2_norm=item_l2_norm,
+            l2_norm_eps=l2_norm_eps,
+            dedup_embeddings=True,
+        )
+        sampling_debug_str = negatives_sampler.debug_str()
     else:
         raise ValueError(f"Unrecognized sampling strategy {sampling_strategy}.")
     sampling_debug_str = negatives_sampler.debug_str()
